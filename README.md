@@ -80,7 +80,7 @@ npm start
 
 ## Notas de Seguridad
 
-Este repositorio no debe incluir:
+Este repositorio no incluye:
 
 - `.env.local`
 - Tokens o llaves privadas.
