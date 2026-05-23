@@ -73,8 +73,11 @@ CREATE TABLE IF NOT EXISTS public.subtasks (
 CREATE TABLE IF NOT EXISTS public.recurring_task_rules (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   task_base_id UUID NOT NULL REFERENCES public.tasks(id) ON DELETE CASCADE,
-  frequency TEXT NOT NULL CHECK (frequency IN ('daily', 'weekly', 'monthly', 'yearly', 'specific_weekday')),
+  frequency TEXT NOT NULL CHECK (frequency IN ('daily', 'weekly', 'monthly', 'yearly', 'specific_weekday', 'custom_interval')),
   weekday INTEGER CHECK (weekday BETWEEN 0 AND 6),
+  weekdays INTEGER[] NOT NULL DEFAULT '{}',
+  month_day INTEGER CHECK (month_day BETWEEN 1 AND 31),
+  interval_days INTEGER CHECK (interval_days >= 1),
   scheduled_time TIME,
   start_date DATE NOT NULL DEFAULT CURRENT_DATE,
   end_date DATE,
@@ -291,6 +294,35 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.notify_department_members(
+  target_department_id UUID,
+  target_task_id UUID,
+  notification_type TEXT,
+  notification_message TEXT,
+  actor_user_id UUID DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  member_record RECORD;
+BEGIN
+  FOR member_record IN
+    SELECT DISTINCT m.user_id
+    FROM public.user_department_memberships m
+    JOIN public.profiles p ON p.id = m.user_id
+    WHERE m.department_id = target_department_id
+      AND m.is_active = TRUE
+      AND p.status = 'active'
+      AND (actor_user_id IS NULL OR m.user_id <> actor_user_id)
+  LOOP
+    PERFORM public.create_notification(member_record.user_id, target_task_id, notification_type, notification_message);
+  END LOOP;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.ensure_current_profile(profile_full_name TEXT DEFAULT NULL)
 RETURNS public.profiles
 LANGUAGE plpgsql
@@ -300,6 +332,7 @@ AS $$
 DECLARE
   bootstrap_email CONSTANT TEXT := 'miguelangelmesagarzon@gmail.com';
   current_email TEXT;
+  metadata_name TEXT;
   user_name TEXT;
   profile_record public.profiles;
 BEGIN
@@ -307,8 +340,8 @@ BEGIN
     RAISE EXCEPTION 'Authentication required';
   END IF;
 
-  SELECT email INTO current_email FROM auth.users WHERE id = auth.uid();
-  user_name := COALESCE(NULLIF(trim(profile_full_name), ''), split_part(current_email, '@', 1));
+  SELECT email, raw_user_meta_data->>'name' INTO current_email, metadata_name FROM auth.users WHERE id = auth.uid();
+  user_name := COALESCE(NULLIF(trim(profile_full_name), ''), NULLIF(trim(metadata_name), ''), split_part(current_email, '@', 1));
 
   INSERT INTO public.profiles(id, full_name, email, role, status, approved_by_id, approved_at)
   VALUES (
@@ -378,7 +411,18 @@ BEGIN
   INSERT INTO public.task_history(task_id, user_id, action, new_value)
   VALUES (NEW.id, NEW.created_by_id, 'task_created', to_jsonb(NEW));
 
-  IF NEW.responsible_id IS NOT NULL AND NEW.responsible_id <> NEW.created_by_id THEN
+  IF EXISTS (
+    SELECT 1 FROM public.profiles
+    WHERE id = NEW.created_by_id AND role = 'admin' AND status = 'active'
+  ) THEN
+    PERFORM public.notify_department_members(
+      NEW.department_id,
+      NEW.id,
+      'department_task_created',
+      'Un administrador agrego una tarea a tu departamento: ' || NEW.title,
+      NEW.created_by_id
+    );
+  ELSIF NEW.responsible_id IS NOT NULL AND NEW.responsible_id <> NEW.created_by_id THEN
     PERFORM public.create_notification(NEW.responsible_id, NEW.id, 'task_assigned', 'Se te asigno una nueva tarea: ' || NEW.title);
   END IF;
 
@@ -437,12 +481,14 @@ BEGIN
     PERFORM public.create_notification(NEW.responsible_id, NEW.id, 'task_assigned', 'Se te asigno una nueva tarea: ' || NEW.title);
   END IF;
 
-  IF OLD.status IS DISTINCT FROM NEW.status THEN
-    PERFORM public.create_notification(NEW.responsible_id, NEW.id, 'status_changed', 'La tarea cambio a estado: ' || NEW.status);
-  END IF;
-
-  IF OLD.status IS DISTINCT FROM NEW.status AND NEW.status = 'completed' THEN
-    PERFORM public.create_notification(NEW.created_by_id, NEW.id, 'task_completed', 'La tarea fue completada: ' || NEW.title);
+  IF OLD.description IS DISTINCT FROM NEW.description THEN
+    PERFORM public.notify_department_members(
+      NEW.department_id,
+      NEW.id,
+      'description_changed',
+      'Se cambio la descripcion de una tarea de tu departamento: ' || NEW.title,
+      actor_id
+    );
   END IF;
 
   RETURN NEW;
@@ -460,19 +506,23 @@ SET search_path = public
 AS $$
 DECLARE
   task_record public.tasks;
+  actor_name TEXT;
 BEGIN
   SELECT * INTO task_record FROM public.tasks WHERE id = NEW.task_id;
+  SELECT COALESCE(NULLIF(trim(full_name), ''), 'Alguien') INTO actor_name
+  FROM public.profiles
+  WHERE id = NEW.user_id;
 
   INSERT INTO public.task_history(task_id, user_id, action, new_value)
   VALUES (NEW.task_id, NEW.user_id, 'comment_added', jsonb_build_object('comment_id', NEW.id, 'comment', NEW.comment));
 
-  IF task_record.responsible_id IS NOT NULL AND task_record.responsible_id <> NEW.user_id THEN
-    PERFORM public.create_notification(task_record.responsible_id, NEW.task_id, 'comment_added', 'Comentaron en una tarea asignada a ti: ' || task_record.title);
-  END IF;
-
-  IF task_record.created_by_id IS NOT NULL AND task_record.created_by_id <> NEW.user_id THEN
-    PERFORM public.create_notification(task_record.created_by_id, NEW.task_id, 'comment_added', 'Comentaron en una tarea que creaste: ' || task_record.title);
-  END IF;
+  PERFORM public.notify_department_members(
+    task_record.department_id,
+    NEW.task_id,
+    'comment_added',
+    COALESCE(actor_name, 'Alguien') || ' comento en una tarea de tu departamento: ' || task_record.title,
+    NEW.user_id
+  );
 
   RETURN NEW;
 END;
@@ -494,9 +544,13 @@ BEGIN
   INSERT INTO public.task_history(task_id, user_id, action, new_value)
   VALUES (NEW.task_id, NEW.uploaded_by_id, 'file_attached', jsonb_build_object('attachment_id', NEW.id, 'file_name', NEW.file_name));
 
-  IF task_record.responsible_id IS NOT NULL AND task_record.responsible_id <> NEW.uploaded_by_id THEN
-    PERFORM public.create_notification(task_record.responsible_id, NEW.task_id, 'file_attached', 'Se adjunto un archivo a la tarea: ' || task_record.title);
-  END IF;
+  PERFORM public.notify_department_members(
+    task_record.department_id,
+    NEW.task_id,
+    'file_attached',
+    'Se adjunto un archivo a una tarea de tu departamento: ' || task_record.title,
+    NEW.uploaded_by_id
+  );
 
   RETURN NEW;
 END;
@@ -554,6 +608,57 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.update_own_profile(profile_full_name TEXT, profile_email TEXT)
+RETURNS public.profiles
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  updated_profile public.profiles;
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  UPDATE public.profiles
+  SET full_name = COALESCE(NULLIF(trim(profile_full_name), ''), full_name),
+      email = COALESCE(NULLIF(trim(profile_email), ''), email),
+      updated_at = NOW()
+  WHERE id = auth.uid()
+  RETURNING * INTO updated_profile;
+
+  RETURN updated_profile;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.request_department_change(requested_department_id UUID, request_reason TEXT DEFAULT NULL)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  requester public.profiles;
+  department_name TEXT;
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  SELECT * INTO requester FROM public.profiles WHERE id = auth.uid();
+  SELECT name INTO department_name FROM public.departments WHERE id = requested_department_id;
+
+  PERFORM public.notify_admins(
+    'department_change_requested',
+    COALESCE(requester.full_name, requester.email, 'Un usuario')
+      || ' solicito cambio de departamento a '
+      || COALESCE(department_name, 'un departamento sin identificar')
+      || COALESCE('. Motivo: ' || NULLIF(trim(request_reason), ''), '')
+  );
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.dashboard_summary(target_department_id UUID DEFAULT NULL)
 RETURNS TABLE (
   total_tasks BIGINT,
@@ -603,21 +708,41 @@ AS $$
   ORDER BY d.name, t.status, t.priority;
 $$;
 
-CREATE OR REPLACE FUNCTION public.calculate_next_run(base_at TIMESTAMPTZ, frequency_value TEXT, weekday_value INTEGER)
+CREATE OR REPLACE FUNCTION public.calculate_next_run(
+  base_at TIMESTAMPTZ,
+  frequency_value TEXT,
+  weekday_value INTEGER,
+  weekdays_value INTEGER[] DEFAULT '{}',
+  month_day_value INTEGER DEFAULT NULL,
+  interval_days_value INTEGER DEFAULT NULL
+)
 RETURNS TIMESTAMPTZ
 LANGUAGE plpgsql
 IMMUTABLE
 AS $$
 DECLARE
   candidate TIMESTAMPTZ;
+  selected_weekdays INTEGER[] := CASE
+    WHEN array_length(weekdays_value, 1) IS NULL OR array_length(weekdays_value, 1) = 0 THEN ARRAY[weekday_value]
+    ELSE weekdays_value
+  END;
   diff_days INTEGER;
 BEGIN
   IF frequency_value = 'daily' THEN
     RETURN base_at + INTERVAL '1 day';
   ELSIF frequency_value = 'weekly' THEN
+    FOR diff_days IN 1..7 LOOP
+      candidate := base_at + (diff_days || ' days')::INTERVAL;
+      IF EXTRACT(DOW FROM candidate)::INTEGER = ANY(selected_weekdays) THEN
+        RETURN candidate;
+      END IF;
+    END LOOP;
     RETURN base_at + INTERVAL '1 week';
   ELSIF frequency_value = 'monthly' THEN
-    RETURN base_at + INTERVAL '1 month';
+    candidate := date_trunc('month', base_at + INTERVAL '1 month')
+      + ((LEAST(COALESCE(month_day_value, EXTRACT(DAY FROM base_at)::INTEGER), EXTRACT(DAY FROM (date_trunc('month', base_at + INTERVAL '1 month') + INTERVAL '1 month' - INTERVAL '1 day'))::INTEGER) - 1) || ' days')::INTERVAL
+      + (base_at - date_trunc('day', base_at));
+    RETURN candidate;
   ELSIF frequency_value = 'yearly' THEN
     RETURN base_at + INTERVAL '1 year';
   ELSIF frequency_value = 'specific_weekday' THEN
@@ -627,6 +752,8 @@ BEGIN
     END IF;
     candidate := base_at + (diff_days || ' days')::INTERVAL;
     RETURN candidate;
+  ELSIF frequency_value = 'custom_interval' THEN
+    RETURN base_at + (COALESCE(interval_days_value, 1) || ' days')::INTERVAL;
   END IF;
 
   RETURN base_at + INTERVAL '1 day';
@@ -679,7 +806,14 @@ BEGIN
     )
     RETURNING id INTO new_task_id;
 
-    next_run := public.calculate_next_run(rule_record.next_run_at, rule_record.frequency, rule_record.weekday);
+    next_run := public.calculate_next_run(
+      rule_record.next_run_at,
+      rule_record.frequency,
+      rule_record.weekday,
+      rule_record.weekdays,
+      rule_record.month_day,
+      rule_record.interval_days
+    );
 
     UPDATE public.recurring_task_rules
     SET last_run_at = NOW(),

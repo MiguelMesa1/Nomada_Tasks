@@ -7,29 +7,40 @@ import { createClient } from 'npm:@insforge/sdk';
  * y llama al RPC generate_recurring_tasks definido en la base de datos.
  */
 
+const allowedOrigin = Deno.env.get('APP_ORIGIN') ?? '*';
+
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Origin': allowedOrigin,
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Cron-Secret'
 };
 
-export default async function(req: Request): Promise<Response> {
+async function generateRecurringTasks(req: Request): Promise<Response> {
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
+  if (!['GET', 'POST'].includes(req.method)) {
+    return json({ error: 'Method not allowed' }, 405);
+  }
+
   try {
     const authHeader = req.headers.get('Authorization');
-    const userToken = authHeader ? authHeader.replace('Bearer ', '') : null;
-    const isProjectApiKey = userToken?.startsWith('ik_') ?? false;
+    const userToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
+    const cronSecret = Deno.env.get('RECURRING_TASKS_CRON_SECRET');
+    const isTrustedCron = Boolean(cronSecret && req.headers.get('X-Cron-Secret') === cronSecret);
+
+    if (!userToken && !isTrustedCron) {
+      return json({ error: 'Unauthorized' }, 401);
+    }
 
     const client = createClient({
       baseUrl: Deno.env.get('INSFORGE_BASE_URL'),
-      edgeFunctionToken: userToken && !isProjectApiKey ? userToken : undefined,
-      anonKey: userToken && !isProjectApiKey ? undefined : (userToken ?? Deno.env.get('API_KEY'))
+      edgeFunctionToken: userToken && !isTrustedCron ? userToken : undefined,
+      anonKey: isTrustedCron ? Deno.env.get('API_KEY') : undefined
     });
 
-    if (userToken && !isProjectApiKey) {
+    if (!isTrustedCron) {
       const { data: userData, error: userError } = await client.auth.getCurrentUser();
       if (userError || !userData?.user?.id) {
         return json({ error: 'Unauthorized' }, 401);
@@ -63,3 +74,5 @@ function json(body: Record<string, unknown>, status = 200): Response {
     headers: { ...corsHeaders, 'Content-Type': 'application/json' }
   });
 }
+
+export default generateRecurringTasks;
